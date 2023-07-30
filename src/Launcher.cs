@@ -2,20 +2,22 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 using System.CommandLine.Parsing;
-using System.Reflection.PortableExecutable;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Security.Authentication;
 
 using static Arctium.WoW.Launcher.Misc.Helpers;
 
 namespace Arctium.WoW.Launcher;
 
-class Launcher
+static class Launcher
 {
-    public static CancellationTokenSource CancellationTokenSource => new();
+    public static readonly CancellationTokenSource CancellationTokenSource = new();
 
-    public static string PrepareGameLaunch(ParseResult commandLineResult)
+    public static string PrepareGameLaunch(ParseResult commandLineResult, IPFilter ipFilter)
     {
         var gameVersion = commandLineResult.GetValueForOption(LaunchOptions.Version);
-        var (SubFolder, BinaryName, MajorGameVersion, MinGameBuild) = gameVersion switch
+        var (subFolder, binaryName, majorGameVersion, minGameBuild) = gameVersion switch
         {
 #if x64
             GameVersion.Retail => ("_retail_", "Wow.exe", new[] { 9, 10 }, 37862),
@@ -36,26 +38,26 @@ class Launcher
         Console.ResetColor();
 
         var currentFolder = AppDomain.CurrentDomain.BaseDirectory;
-        var gameFolder = $"{currentFolder}/{SubFolder}";
+        var gameFolder = $"{currentFolder}/{subFolder}";
 
         if (commandLineResult.HasOption(LaunchOptions.GameBinary))
-            BinaryName = commandLineResult.GetValueForOption(LaunchOptions.GameBinary);
+            binaryName = commandLineResult.GetValueForOption(LaunchOptions.GameBinary);
 
-        var gameBinaryPath = $"{gameFolder}/{BinaryName}";
+        var gameBinaryPath = $"{gameFolder}/{binaryName}";
 
         if (commandLineResult.HasOption(LaunchOptions.GamePath))
         {
             gameFolder = commandLineResult.GetValueForOption(LaunchOptions.GamePath);
-            gameBinaryPath = $"{gameFolder}/{BinaryName}";
+            gameBinaryPath = $"{gameFolder}/{binaryName}";
         }
         else if (!File.Exists(gameBinaryPath))
         {
             // Also support game installations without branch sub folders.
             gameFolder = currentFolder;
-            gameBinaryPath = $"{gameFolder}/{BinaryName}";
+            gameBinaryPath = $"{gameFolder}/{binaryName}";
         }
 
-        if (!File.Exists(gameBinaryPath) || !MajorGameVersion.Contains(GetVersionValueFromClient(gameBinaryPath).Major))
+        if (!File.Exists(gameBinaryPath) || !majorGameVersion.Contains(GetVersionValueFromClient(gameBinaryPath).Major))
         {
             Console.ForegroundColor = ConsoleColor.Red;
             Console.WriteLine($"[Error] No {gameVersion} client found.");
@@ -65,11 +67,11 @@ class Launcher
 
         var gameClientBuild = GetVersionValueFromClient(gameBinaryPath).Build;
 
-        if (gameClientBuild < MinGameBuild && gameClientBuild != 0)
+        if (gameClientBuild < minGameBuild && gameClientBuild != 0)
         {
             Console.ForegroundColor = ConsoleColor.Red;
             Console.WriteLine($"Your found client version {gameClientBuild} is not supported.");
-            Console.WriteLine($"The minimum required build is {MinGameBuild}");
+            Console.WriteLine($"The minimum required build is {minGameBuild}");
 
             return string.Empty;
         }
@@ -88,11 +90,117 @@ class Launcher
             }
         }
 
+        var configPath = $"{gameFolder}/WTF/{commandLineResult.GetValueForOption(LaunchOptions.GameConfig)}";
+        (string IPAddress, string HostName, int Port) portal = new();
+
+        if (!File.Exists(configPath))
+            LaunchOptions.IsDevModeAllowed = false;
+        else
+        {
+            var config = File.ReadAllText(configPath);
+
+            portal = ParsePortal(config);
+
+            LaunchOptions.IsDevModeAllowed = IsDevModeAllowed(ipFilter, portal.IPAddress);
+        }
+
+        if (!LaunchOptions.IsDevModeAllowed)
+            LaunchOptions.DevMode = new("--dev", () => false);
+
+        var devModeEnabled = commandLineResult.GetValueForOption(LaunchOptions.DevMode) && LaunchOptions.IsDevModeAllowed;
+
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine($"Developer mode: {(devModeEnabled ? "Enabled" : "Disabled")}");
+        Console.WriteLine();
+        Console.ForegroundColor = ConsoleColor.Gray;
+
+        // Check for valid certificate when dev mode is disabled.
+        if (!devModeEnabled)
+        {
+            try
+            {
+                using var tcpClient = new TcpClient(portal.HostName, portal.Port);
+                
+                // Cancel after 5 seconds.
+                tcpClient.ReceiveTimeout = 5000;
+                tcpClient.SendTimeout = 5000;
+                
+                using var sslStream = new SslStream(tcpClient.GetStream(), false,
+                    (_, _, _, sslPolicyErrors) =>
+                    {
+                        // Redirect to the trusted cert warning.
+                        if (sslPolicyErrors != SslPolicyErrors.None)
+                            throw new AuthenticationException();
+                        
+                        Console.ForegroundColor = ConsoleColor.Green;
+                        Console.WriteLine($"Certificate for server '{portal.HostName}' successfully validated.");
+                        Console.WriteLine();
+                        Console.ResetColor();
+
+                        return true;
+                    },
+                    null
+                );
+
+                sslStream.AuthenticateAsClient(portal.HostName);
+            }
+            catch (SocketException)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"{portal.HostName}:{portal.Port} is offline.");
+                Console.ResetColor();
+
+                return string.Empty;
+            }
+            catch (AuthenticationException)
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"Server with host name {portal.HostName} does not have a trusted certificate attached.");
+                Console.WriteLine("If you are the server owner be sure to generate one and replace the default bnet server certificate.");
+                Console.WriteLine("One way to generate one is through Let's Encrypt.");
+                Console.ResetColor();
+
+                return string.Empty;
+            }
+        }
+
         return gameBinaryPath;
     }
 
-    public static bool LaunchGame(string appPath, string gameCommandLine, bool useStaticAuthSeed)
+    public static bool LaunchGame(string appPath, string gameCommandLine, ParseResult commandLineResult)
     {
+        // Build the version URL from the game binary build.
+        var clientVersion = GetVersionValueFromClient(appPath);
+
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine($"Client Build {clientVersion}");
+        Console.WriteLine($"Client Path '{appPath}'");
+        Console.WriteLine();
+        Console.ResetColor();
+
+        // Assign the region and product dependent version url to check it's online status.
+        var versionUrl = commandLineResult.GetValueForOption(LaunchOptions.VersionUrl)
+            ?? Patches.Common.GetVersionUrl(clientVersion.Build, commandLineResult.GetValueForOption(LaunchOptions.CdnRegion),
+                                            commandLineResult.GetValueForOption(LaunchOptions.ProductName));
+
+        if (!CheckUrl(versionUrl, fallbackUrl: Patterns.Common.VersionUrl).GetAwaiter().GetResult())
+            versionUrl = Patterns.Common.VersionUrl;
+        else
+            // Assign the region and product independent version url.
+            versionUrl = commandLineResult.GetValueForOption(LaunchOptions.VersionUrl) ?? Patches.Common.GetVersionUrl(clientVersion.Build);
+
+        var cdnsUrl = commandLineResult.GetValueForOption(LaunchOptions.CdnsUrl) ?? Patches.Common.CdnsUrl;
+
+        if (!CheckUrl(cdnsUrl, fallbackUrl: Patterns.Common.CdnsUrl).GetAwaiter().GetResult())
+            cdnsUrl = Patterns.Common.CdnsUrl;
+
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("Game CDN connection info:");
+        Console.WriteLine($"Version file: {versionUrl}");
+        Console.WriteLine($"CDNs file: {cdnsUrl}");
+        Console.WriteLine();
+        Console.ResetColor();
+
         var startupInfo = new StartupInfo();
         var processInfo = new ProcessInformation();
 
@@ -101,7 +209,8 @@ class Launcher
             Console.ForegroundColor = ConsoleColor.White;
             Console.WriteLine("Starting WoW client...");
 
-            var createSuccess = NativeWindows.CreateProcess(null, $"{appPath} {gameCommandLine}", 0, 0, false, 4, 0, new FileInfo(appPath)?.DirectoryName, ref startupInfo, out processInfo);
+            var createSuccess = NativeWindows.CreateProcess(null, $"{appPath} {gameCommandLine}", 0, 0, false, 4, 0, new FileInfo(appPath).DirectoryName,
+                ref startupInfo, out processInfo);
 
             // On some systems we have to launch the game with the application name used.
             if (!createSuccess)
@@ -117,10 +226,11 @@ class Launcher
                 // Resume the process to initialize it.
                 NativeWindows.NtResumeProcess(processInfo.ProcessHandle);
 
-                var mbi = new MemoryBasicInformation();
+                MemoryBasicInformation mbi;
 
                 // Wait for the memory region to be initialized.
-                while (NativeWindows.VirtualQueryEx(processInfo.ProcessHandle, memory.BaseAddress, out mbi, MemoryBasicInformation.Size) == 0 || mbi.RegionSize <= 0x1000)
+                while (NativeWindows.VirtualQueryEx(processInfo.ProcessHandle, memory.BaseAddress, out mbi, MemoryBasicInformation.Size) == 0 ||
+                       mbi.RegionSize <= 0x1000)
                 { }
 
                 if (mbi.BaseAddress != 0)
@@ -129,46 +239,71 @@ class Launcher
 
                     byte[] certBundleData = Convert.FromBase64String(Patches.Common.CertBundleData);
 
-                    // Build the version URL from the game binary build.
-                    var clientVersion = GetVersionValueFromClient(appPath);
-                    byte[] versionPatch = Patches.Common.GetVersionUrl(clientVersion.Build);
 
                     // Refresh the client data before patching.
                     memory.RefreshMemoryData((int)gameAppData.Length);
 
                     // We need to cache this here since we are using our RSA modulus as auth seed.
                     var modulusOffset = memory.Data.FindPattern(Patterns.Common.SignatureModulus);
+                    var legacyCertMode = clientVersion is (1, >= 14, <= 3, _) or (3, 4, <= 1, _) or (9, _, _, _) or (10, <= 1, < 5, _);
+
+                    if (legacyCertMode)
+                    {
+                        Task.WaitAll(new[]
+                        {
+                            memory.PatchMemory(Patterns.Common.CertBundle, certBundleData, "Certificate Bundle"),
+                            memory.PatchMemory(Patterns.Common.SignatureModulus, Patches.Common.SignatureModulus, "Certificate Signature RsaModulus")
+                        }, CancellationTokenSource.Token);
+                    }
+
 
                     // Wait for all direct memory patch tasks to complete,
                     Task.WaitAll(new[]
                     {
-                        memory.PatchMemory(Patterns.Common.CertBundle, certBundleData, "Certificate Bundle"),
-                        memory.PatchMemory(Patterns.Common.SignatureModulus, Patches.Common.SignatureModulus, "Certificate Signature RsaModulus"),
                         memory.PatchMemory(Patterns.Common.ConnectToModulus, Patches.Common.RsaModulus, "ConnectTo RsaModulus"),
 
                         // Recent clients have a different signing algorithm in EnterEncryptedMode.
-                        (clientVersion is (9, 2, 7, _) or (3, _, _, _) or (10, _, _, _))
-                        ? memory.PatchMemory(Patterns.Common.CryptoEdPublicKey, Patches.Common.CryptoEdPublicKey, "GameCrypto Ed25519 PublicKey")
-                        : memory.PatchMemory(Patterns.Common.CryptoRsaModulus, Patches.Common.RsaModulus, "GameCrypto RsaModulus"),
+                        clientVersion is (9, 2, 7, _) or (3, _, _, _) or (10, _, _, _) or (1, >= 14, >= 4, _)
+                            ? memory.PatchMemory(Patterns.Common.CryptoEdPublicKey, Patches.Common.CryptoEdPublicKey, "GameCrypto Ed25519 PublicKey")
+                            : memory.PatchMemory(Patterns.Common.CryptoRsaModulus, Patches.Common.RsaModulus, "GameCrypto RsaModulus"),
 
                         memory.PatchMemory(Patterns.Common.Portal, Patches.Common.Portal, "Login Portal"),
-                        memory.PatchMemory(Patterns.Common.VersionUrl, versionPatch, "Version URL"),
-                        memory.PatchMemory(Patterns.Common.CdnsUrl, Patches.Common.CdnsUrl, "CDNs URL"),
+                        memory.PatchMemory(Patterns.Common.VersionUrl.ToPattern(), Encoding.UTF8.GetBytes(versionUrl), "Version URL"),
+                        memory.PatchMemory(Patterns.Common.CdnsUrl.ToPattern(), Encoding.UTF8.GetBytes(cdnsUrl), "CDNs URL"),
                         memory.PatchMemory(Patterns.Windows.LauncherLogin, Patches.Windows.LauncherLogin, "Launcher Login Registry")
                     }, CancellationTokenSource.Token);
 
                     NativeWindows.NtResumeProcess(processInfo.ProcessHandle);
 
-                    WaitForUnpack(ref processInfo, memory, ref mbi, gameAppData);
+                    // Enable anti crash in dev mode, custom file mode or static auth seed mode.
+#if CUSTOM_FILES
+                    var antiCrash = true;
+#else
+                    var antiCrash = legacyCertMode || commandLineResult.HasOption(LaunchOptions.UseStaticAuthSeed) ||
+                                commandLineResult.GetValueForOption(LaunchOptions.DevMode) && LaunchOptions.IsDevModeAllowed;
+#endif
+
+                    WaitForUnpack(ref processInfo, memory, ref mbi, gameAppData, antiCrash);
 
 #if x64
-                    Task.WaitAll(new[]
+                    if (legacyCertMode)
                     {
-                        memory.QueuePatch(Patterns.Windows.CertBundle, Patches.Windows.CertBundle, "CertBundle"),
-                        memory.QueuePatch(Patterns.Windows.CertCommonName, Patches.Windows.CertCommonName, "CertCommonName", 5)
-                    }, CancellationTokenSource.Token);
+                        Task.WaitAll(new[]
+                        {
+                            memory.QueuePatch(Patterns.Windows.CertBundle, Patches.Windows.CertBundle, "CertBundle"),
+                            memory.QueuePatch(Patterns.Windows.CertCommonName, Patches.Windows.CertCommonName, "CertCommonName", 5)
+                        }, CancellationTokenSource.Token);
+                    }
+                    else if (LaunchOptions.IsDevModeAllowed && commandLineResult.GetValueForOption(LaunchOptions.DevMode))
+                    {
+                        Task.WaitAll(new[]
+                        {
+                            memory.QueuePatch(Patterns.Windows.CertChain, Patches.Windows.CertChain, "CertChain"),
+                            memory.QueuePatch(Patterns.Windows.CertCommonName, Patches.Windows.CertCommonName, "CertCommonName", 5)
+                        }, CancellationTokenSource.Token);
+                    }
 
-                    if (useStaticAuthSeed)
+                    if (commandLineResult.HasOption(LaunchOptions.UseStaticAuthSeed))
                     {
                         Console.ForegroundColor = ConsoleColor.Cyan;
                         Console.WriteLine("Static auth seed used. Be sure that the server you are connecting to supports it.");
@@ -186,12 +321,12 @@ class Launcher
                     Task.WaitAll(new[]
                     {
                         (clientVersion is (10, _, _, _))
-                        ? memory.QueuePatch(Patterns.Windows.LoadByFileIdAlternate, Patches.Windows.NoJump, "LoadByFileId", 3)
-                        : memory.QueuePatch(Patterns.Windows.LoadByFileId, Patches.Windows.NoJump, "LoadByFileId", 6),
+                            ? memory.QueuePatch(Patterns.Windows.LoadByFileIdAlternate, Patches.Windows.NoJump, "LoadByFileId", 3)
+                            : memory.QueuePatch(Patterns.Windows.LoadByFileId, Patches.Windows.NoJump, "LoadByFileId", 6),
 
                         (clientVersion is (10, _, _, _))
-                        ? memory.QueuePatch(Patterns.Windows.LoadByFilePathAlternate, Patches.Windows.NoJump, "LoadByFilePath", 3)
-                        : memory.QueuePatch(Patterns.Windows.LoadByFilePath, Patches.Windows.NoJump, "LoadByFilePath", 3)
+                            ? memory.QueuePatch(Patterns.Windows.LoadByFilePathAlternate, Patches.Windows.NoJump, "LoadByFilePath", 3)
+                            : memory.QueuePatch(Patterns.Windows.LoadByFilePath, Patches.Windows.NoJump, "LoadByFilePath", 3)
                     }, CancellationTokenSource.Token);
 
                     var (idAlloc, stringAlloc) = ModLoader.LoadFileMappings(processInfo.ProcessHandle);
@@ -213,7 +348,7 @@ class Launcher
 
                     NativeWindows.NtResumeProcess(processInfo.ProcessHandle);
 
-                    if (memory.RemapAndPatch())
+                    if (memory.RemapAndPatch(antiCrash))
                     {
                         Console.WriteLine("Done :) ");
 
@@ -234,9 +369,14 @@ class Launcher
                 }
             }
         }
+        // Only exit and do not print any exception messages to the console.
+        catch (OperationCanceledException)
+        {
+            NativeWindows.TerminateProcess(processInfo.ProcessHandle, 0);
+        }
+        // Just print out the exception we have and kill the game process.
         catch (Exception ex)
         {
-            // Just print out the exception we have and kill the game process.
             Console.WriteLine(ex);
             Console.WriteLine(ex.StackTrace);
 
@@ -250,6 +390,8 @@ class Launcher
 
         return false;
     }
+
+    static bool IsDevModeAllowed(IPFilter ipFilter, string portalIP) => ipFilter.IsInRange(portalIP);
 
     static long GenerateAuthSeedFunctionPatch(WinMemory memory, long modulusOffset)
     {
@@ -275,23 +417,23 @@ class Launcher
 #endif
     }
 
-    static void WaitForUnpack(ref ProcessInformation processInfo, WinMemory memory, ref MemoryBasicInformation mbi, Stream gameAppData)
+    static void WaitForUnpack(ref ProcessInformation processInfo, WinMemory memory, ref MemoryBasicInformation mbi, Stream gameAppData, bool antiCrash)
     {
 #if x64
         // Wait for client initialization.
-        var initOffset = memory?.Read(mbi.BaseAddress, (int)mbi.RegionSize)?.FindPattern(Patterns.Windows.Init) ?? 0;
+        var initOffset = memory.Read(mbi.BaseAddress, (int)mbi.RegionSize)?.FindPattern(Patterns.Windows.Init) ?? 0;
 
         while (initOffset == 0)
         {
-            initOffset = memory?.Read(mbi.BaseAddress, (int)mbi.RegionSize)?.FindPattern(Patterns.Windows.Init) ?? 0;
+            initOffset = memory.Read(mbi.BaseAddress, (int)mbi.RegionSize)?.FindPattern(Patterns.Windows.Init) ?? 0;
 
             Console.WriteLine("Waiting for client initialization...");
         }
 
         initOffset += BitConverter.ToUInt32(memory.Read(initOffset + memory.BaseAddress + 2, 4), 0) + 10;
 
-        while (memory?.Read(initOffset + memory.BaseAddress, 1)?[0] == null ||
-               memory?.Read(initOffset + memory.BaseAddress, 1)?[0] == 0)
+        while (memory.Read(initOffset + memory.BaseAddress, 1)?[0] == null ||
+               memory.Read(initOffset + memory.BaseAddress, 1)?[0] == 0)
             memory.Data = memory.Read(mbi.BaseAddress, (int)mbi.RegionSize);
 #else
         // Get PE header info for client initialization.
@@ -310,7 +452,8 @@ class Launcher
         while (memory?.Read(virtualTextSectionEnd, 1)?[0] == null || memory?.Read(virtualTextSectionEnd, 1)?[0] == textSectionEndValue)
             Thread.Sleep(100);
 #endif
-        PrepareAntiCrash(memory, ref mbi, ref processInfo);
+        if (antiCrash)
+            PrepareAntiCrash(memory, ref mbi, ref processInfo);
 
         memory.RefreshMemoryData((int)mbi.RegionSize);
     }
@@ -343,7 +486,6 @@ class Launcher
         foreach (var a in remapOffsets)
         {
             var instructionStart = (int)a + 4;
-            var instructionEnd = (int)a + 4 + 6;
             var instructions = new byte[6];
 
             Buffer.BlockCopy(memory.Data, instructionStart, instructions, 0, 6);
@@ -352,7 +494,7 @@ class Launcher
             if (WinMemory.IsUnconditionalJump(instructions))
                 continue;
 
-            var operandValue = 0;
+            int operandValue;
 
             if (WinMemory.IsShortJump(instructions))
                 operandValue = instructions[1] + 2;
@@ -392,7 +534,6 @@ class Launcher
                         // Might need some better checks or future updates.
                         if (memory.Data[i - 3] == 0x48)
                         {
-                            var iBytes = BitConverter.GetBytes(i);
                             var jumpBytes = new byte[] { 0xEB };
 
                             tempPatches.TryAdd($"ShortJump{i}", (i, jumpBytes));

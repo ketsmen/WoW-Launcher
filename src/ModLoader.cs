@@ -6,17 +6,17 @@ namespace Arctium.WoW.Launcher;
 #if x64
 class ModLoader
 {
-    static readonly HashSet<uint> loadedFileIds = new();
+    static readonly HashSet<uint> _loadedFileIds = new();
 
     public static bool HookClient(WinMemory memory, nint processHandle, nint idAlloc, nint stringAlloc)
     {
         var asm = new byte[]
         {
-                0x85, 0xD2, 0x0F, 0x88, 0x72, 0xAF, 0xFF, 0xFF, 0x33, 0xC0,
-                0x49, 0xB9, 0x22, 0x22, 0x22, 0x22, 0x11, 0x11, 0x11, 0x11,
-                0x8D, 0x0C, 0x40, 0xC1, 0xE1, 0x02, 0x42, 0x39, 0x14, 0x09,
-                0x74, 0x0C, 0xFF, 0xC0, 0x3D, 0xEF, 0xBE, 0xAD, 0xDE, 0x72,
-                0xEB, 0x33, 0xC0, 0xC3, 0x4A, 0x8B, 0x44, 0x09, 0x04, 0xC3
+            0x85, 0xD2, 0x0F, 0x88, 0x72, 0xAF, 0xFF, 0xFF, 0x33, 0xC0,
+            0x49, 0xB9, 0x22, 0x22, 0x22, 0x22, 0x11, 0x11, 0x11, 0x11,
+            0x8D, 0x0C, 0x40, 0xC1, 0xE1, 0x02, 0x42, 0x39, 0x14, 0x09,
+            0x74, 0x0C, 0xFF, 0xC0, 0x3D, 0xEF, 0xBE, 0xAD, 0xDE, 0x72,
+            0xEB, 0x33, 0xC0, 0xC3, 0x4A, 0x8B, 0x44, 0x09, 0x04, 0xC3
         };
 
         var trampolineInjectAddress = NativeWindows.VirtualAllocEx(processHandle, IntPtr.Zero, (uint)asm.Length + 32, 0x00001000, (uint)MemProtection.ExecuteRead);
@@ -29,7 +29,7 @@ class ModLoader
         var hookAddress = memory.Data.FindPattern(Patterns.Windows.CustomFileIdHook);
 
         if (hookAddress == 0)
-            return false;
+            throw new InvalidDataException("CustomFileIdHook");
 
         // Read original data from the hook function.
         var originalBytes = memory.Read(memory.BaseAddress + hookAddress, 13);
@@ -38,13 +38,13 @@ class ModLoader
         memory.QueuePatch(hookAddress, hookInstructions, "CustomFileIdHook");
 
         // Copy count bytes.
-        Buffer.BlockCopy(BitConverter.GetBytes(loadedFileIds.Count), 0, asm, 35, 4);
+        Buffer.BlockCopy(BitConverter.GetBytes(_loadedFileIds.Count), 0, asm, 35, 4);
 
         // Copy mapping ptr bytes.
         Buffer.BlockCopy(BitConverter.GetBytes(idAlloc), 0, asm, 12, 8);
 
         // Calculate the jump address bytes.
-        var trampolineJmpAddress = (uint)(trampolineInjectAddress + asm.Length - (memory.BaseAddress + (int)trampolineInjectAddress + 2) - 6);
+        var trampolineJmpAddress = (uint)(trampolineInjectAddress + asm.Length - (trampolineInjectAddress + 2) - 6);
 
         // Copy trampoline bytes.
         Buffer.BlockCopy(BitConverter.GetBytes(trampolineJmpAddress), 0, asm, 4, 4);
@@ -121,7 +121,7 @@ class ModLoader
         return default;
     }
 
-    static bool GetFileMappingData(List<(byte[] fileId, byte[] path, uint StringPos)> loadedMappings, out uint count, ref uint stringLength, string mappingFile)
+    static void GetFileMappingData(List<(byte[] fileId, byte[] path, uint StringPos)> loadedMappings, out uint count, ref uint stringLength, string mappingFile)
     {
         var mappings = File.ReadAllLines(mappingFile).Where(s => s.Trim() != "")
             .Select(s => s.ToLowerInvariant().Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
@@ -145,13 +145,13 @@ class ModLoader
             {
                 var id = uint.Parse(fileId);
 
-                if (loadedFileIds.Contains(id))
+                if (_loadedFileIds.Contains(id))
                 {
                     Console.WriteLine($"Skipping overlapping file '{id} - {f}'.");
                     continue;
                 }
 
-                loadedFileIds.Add(id);
+                _loadedFileIds.Add(id);
 
                 loadedMappings.Add((BitConverter.GetBytes(id), pathBytes, stringLength));
 
@@ -160,11 +160,6 @@ class ModLoader
         }
 
         count = (uint)loadedMappings.Count;
-
-        if (loadedMappings.Count == 0)
-            return false;
-
-        return true;
     }
 
     static (nint, nint) AllocateFileMapping(nint handle, List<(byte[] fileId, byte[] path, uint StringPos)> loadedMappings, uint count, uint stringLength)
@@ -176,11 +171,11 @@ class ModLoader
 
         Parallel.For(0, loadedMappings.Count, m =>
         {
-            var (fileId, path, StringPos) = loadedMappings[m];
+            var (fileId, path, stringPos) = loadedMappings[m];
 
             Buffer.BlockCopy(fileId, 0, idAllocData, m * 12, fileId.Length);
-            Buffer.BlockCopy(BitConverter.GetBytes(stringAlloc + StringPos), 0, idAllocData, (m * 12) + 4, 8);
-            Buffer.BlockCopy(path, 0, stringAllocData, (int)StringPos, path.Length);
+            Buffer.BlockCopy(BitConverter.GetBytes(stringAlloc + stringPos), 0, idAllocData, (m * 12) + 4, 8);
+            Buffer.BlockCopy(path, 0, stringAllocData, (int)stringPos, path.Length);
         });
 
         NativeWindows.WriteProcessMemory(handle, idAlloc, idAllocData, idAllocData.Length, out var _);
