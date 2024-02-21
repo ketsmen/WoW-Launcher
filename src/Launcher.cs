@@ -14,20 +14,14 @@ static class Launcher
 {
     public static readonly CancellationTokenSource CancellationTokenSource = new();
 
-    public static string PrepareGameLaunch(ParseResult commandLineResult, IPFilter ipFilter)
+    public static async ValueTask<string> PrepareGameLaunch(ParseResult commandLineResult, IPFilter ipFilter)
     {
         var gameVersion = commandLineResult.GetValueForOption(LaunchOptions.Version);
         var (subFolder, binaryName, majorGameVersion, minGameBuild) = gameVersion switch
         {
-#if x64
             GameVersion.Retail => ("_retail_", "Wow.exe", new[] { 9, 10 }, 37862),
             GameVersion.Classic => ("_classic_", "WowClassic.exe", new[] { 2, 3 }, 39926),
             GameVersion.ClassicEra => ("_classic_era_", "WowClassic.exe", new[] { 1 }, 40347),
-#elif ARM64
-            GameVersion.Retail => ("_retail_", "Wow-ARM64.exe", new[] { 9, 10 }, 37862),
-            GameVersion.Classic => ("_classic_", "WowClassic-arm64.exe", new[] { 2, 3 }, 39926),
-            GameVersion.ClassicEra => ("_classic_era_", "WowClassic-arm64.exe", new[] { 1 }, 40347),
-#endif
             _ => throw new NotImplementedException("Invalid game version specified."),
         };
 
@@ -112,6 +106,7 @@ static class Launcher
         Console.ForegroundColor = ConsoleColor.Yellow;
         Console.WriteLine($"Developer mode: {(devModeEnabled ? "Enabled" : "Disabled")}");
         Console.WriteLine();
+        Console.WriteLine($"Client Portal '{portal.HostName}'");
         Console.ForegroundColor = ConsoleColor.Gray;
 
         // Check for valid certificate when dev mode is disabled.
@@ -119,19 +114,18 @@ static class Launcher
         {
             try
             {
-                using var tcpClient = new TcpClient(portal.HostName, portal.Port);
-                
-                // Cancel after 5 seconds.
-                tcpClient.ReceiveTimeout = 5000;
-                tcpClient.SendTimeout = 5000;
-                
+                using var tcpClient = new TcpClient();
+                using var tcpClientTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+                await tcpClient.ConnectAsync(portal.HostName, portal.Port, tcpClientTimeout.Token);
+
                 using var sslStream = new SslStream(tcpClient.GetStream(), false,
                     (_, _, _, sslPolicyErrors) =>
                     {
                         // Redirect to the trusted cert warning.
                         if (sslPolicyErrors != SslPolicyErrors.None)
                             throw new AuthenticationException();
-                        
+
                         Console.ForegroundColor = ConsoleColor.Green;
                         Console.WriteLine($"Certificate for server '{portal.HostName}' successfully validated.");
                         Console.WriteLine();
@@ -144,7 +138,7 @@ static class Launcher
 
                 sslStream.AuthenticateAsClient(portal.HostName);
             }
-            catch (SocketException)
+            catch (Exception exception) when (exception is SocketException or OperationCanceledException)
             {
                 Console.ForegroundColor = ConsoleColor.Red;
                 Console.WriteLine($"{portal.HostName}:{portal.Port} is offline.");
@@ -239,7 +233,6 @@ static class Launcher
 
                     byte[] certBundleData = Convert.FromBase64String(Patches.Common.CertBundleData);
 
-
                     // Refresh the client data before patching.
                     memory.RefreshMemoryData((int)gameAppData.Length);
 
@@ -247,31 +240,33 @@ static class Launcher
                     var modulusOffset = memory.Data.FindPattern(Patterns.Common.SignatureModulus);
                     var legacyCertMode = clientVersion is (1, >= 14, <= 3, _) or (3, 4, <= 1, _) or (9, _, _, _) or (10, <= 1, < 5, _);
 
-                    if (legacyCertMode)
+                    if (!commandLineResult.GetValueForOption(LaunchOptions.SkipConnectionPatching))
                     {
+                        if (legacyCertMode)
+                        {
+                            Task.WaitAll(new[]
+                            {
+                                memory.PatchMemory(Patterns.Common.CertBundle, certBundleData, "Certificate Bundle"),
+                                memory.PatchMemory(Patterns.Common.SignatureModulus, Patches.Common.SignatureModulus, "Certificate Signature RsaModulus")
+                            }, CancellationTokenSource.Token);
+                        }
+
+                        // Wait for all direct memory patch tasks to complete,
                         Task.WaitAll(new[]
                         {
-                            memory.PatchMemory(Patterns.Common.CertBundle, certBundleData, "Certificate Bundle"),
-                            memory.PatchMemory(Patterns.Common.SignatureModulus, Patches.Common.SignatureModulus, "Certificate Signature RsaModulus")
+                            memory.PatchMemory(Patterns.Common.ConnectToModulus, Patches.Common.RsaModulus, "ConnectTo RsaModulus"),
+
+                            // Recent clients have a different signing algorithm in EnterEncryptedMode.
+                            clientVersion is (9, 2, 7, _) or (3, _, _, _) or (10, _, _, _) or (1, >= 14, >= 4, _)
+                                ? memory.PatchMemory(Patterns.Common.CryptoEdPublicKey, Patches.Common.CryptoEdPublicKey, "GameCrypto Ed25519 PublicKey")
+                                : memory.PatchMemory(Patterns.Common.CryptoRsaModulus, Patches.Common.RsaModulus, "GameCrypto RsaModulus"),
+
+                            memory.PatchMemory(Patterns.Common.Portal, Patches.Common.Portal, "Login Portal"),
+                            memory.PatchMemory(Patterns.Common.VersionUrl.ToPattern(), Encoding.UTF8.GetBytes(versionUrl), "Version URL"),
+                            memory.PatchMemory(Patterns.Common.CdnsUrl.ToPattern(), Encoding.UTF8.GetBytes(cdnsUrl), "CDNs URL"),
+                            memory.PatchMemory(Patterns.Windows.LauncherLogin, Patches.Windows.LauncherLogin, "Launcher Login Registry")
                         }, CancellationTokenSource.Token);
                     }
-
-
-                    // Wait for all direct memory patch tasks to complete,
-                    Task.WaitAll(new[]
-                    {
-                        memory.PatchMemory(Patterns.Common.ConnectToModulus, Patches.Common.RsaModulus, "ConnectTo RsaModulus"),
-
-                        // Recent clients have a different signing algorithm in EnterEncryptedMode.
-                        clientVersion is (9, 2, 7, _) or (3, _, _, _) or (10, _, _, _) or (1, >= 14, >= 4, _)
-                            ? memory.PatchMemory(Patterns.Common.CryptoEdPublicKey, Patches.Common.CryptoEdPublicKey, "GameCrypto Ed25519 PublicKey")
-                            : memory.PatchMemory(Patterns.Common.CryptoRsaModulus, Patches.Common.RsaModulus, "GameCrypto RsaModulus"),
-
-                        memory.PatchMemory(Patterns.Common.Portal, Patches.Common.Portal, "Login Portal"),
-                        memory.PatchMemory(Patterns.Common.VersionUrl.ToPattern(), Encoding.UTF8.GetBytes(versionUrl), "Version URL"),
-                        memory.PatchMemory(Patterns.Common.CdnsUrl.ToPattern(), Encoding.UTF8.GetBytes(cdnsUrl), "CDNs URL"),
-                        memory.PatchMemory(Patterns.Windows.LauncherLogin, Patches.Windows.LauncherLogin, "Launcher Login Registry")
-                    }, CancellationTokenSource.Token);
 
                     NativeWindows.NtResumeProcess(processInfo.ProcessHandle);
 
@@ -285,22 +280,24 @@ static class Launcher
 
                     WaitForUnpack(ref processInfo, memory, ref mbi, gameAppData, antiCrash);
 
-#if x64
-                    if (legacyCertMode)
+                    if (!commandLineResult.GetValueForOption(LaunchOptions.SkipConnectionPatching))
                     {
-                        Task.WaitAll(new[]
+                        if (legacyCertMode)
                         {
-                            memory.QueuePatch(Patterns.Windows.CertBundle, Patches.Windows.CertBundle, "CertBundle"),
-                            memory.QueuePatch(Patterns.Windows.CertCommonName, Patches.Windows.CertCommonName, "CertCommonName", 5)
-                        }, CancellationTokenSource.Token);
-                    }
-                    else if (LaunchOptions.IsDevModeAllowed && commandLineResult.GetValueForOption(LaunchOptions.DevMode))
-                    {
-                        Task.WaitAll(new[]
+                            Task.WaitAll(new[]
+                            {
+                                memory.QueuePatch(Patterns.Windows.CertBundle, Patches.Windows.CertBundle, "CertBundle"),
+                                memory.QueuePatch(Patterns.Windows.CertCommonName, Patches.Windows.CertCommonName, "CertCommonName", 5)
+                            }, CancellationTokenSource.Token);
+                        }
+                        else if (LaunchOptions.IsDevModeAllowed && commandLineResult.GetValueForOption(LaunchOptions.DevMode))
                         {
-                            memory.QueuePatch(Patterns.Windows.CertChain, Patches.Windows.CertChain, "CertChain"),
-                            memory.QueuePatch(Patterns.Windows.CertCommonName, Patches.Windows.CertCommonName, "CertCommonName", 5)
-                        }, CancellationTokenSource.Token);
+                            Task.WaitAll(new[]
+                            {
+                                memory.QueuePatch(Patterns.Windows.CertChain, Patches.Windows.CertChain, "CertChain"),
+                                memory.QueuePatch(Patterns.Windows.CertCommonName, Patches.Windows.CertCommonName, "CertCommonName", 5)
+                            }, CancellationTokenSource.Token);
+                        }
                     }
 
                     if (commandLineResult.HasOption(LaunchOptions.UseStaticAuthSeed))
@@ -336,14 +333,6 @@ static class Launcher
                         if (!ModLoader.HookClient(memory, processInfo.ProcessHandle, idAlloc, stringAlloc))
                             return false;
                     }
-#endif
-
-#elif ARM64
-                    Task.WaitAll(new[]
-                    {
-                        memory.QueuePatch(Patterns.Windows.CertBundle, Patches.Windows.Branch, "CertBundle", 19),
-                        memory.QueuePatch(Patterns.Windows.CertCommonName, Patches.Windows.CertCommonName, "CertCommonName", 6),
-                    }, CancellationTokenSource.Token);
 #endif
 
                     NativeWindows.NtResumeProcess(processInfo.ProcessHandle);
@@ -395,7 +384,6 @@ static class Launcher
 
     static long GenerateAuthSeedFunctionPatch(WinMemory memory, long modulusOffset)
     {
-#if x64
         var authSeedLoadOffset = memory.Data.FindPattern(Patterns.Windows.AuthSeed);
 
         if (authSeedLoadOffset == 0)
@@ -412,14 +400,10 @@ static class Launcher
         Unsafe.WriteUnaligned(ref Patches.Windows.AuthSeed[3], (uint)(modulusOffset - authSeedFunctionOffset - 7));
 
         return authSeedFunctionOffset;
-#else
-        throw new NotImplementedException();
-#endif
     }
 
     static void WaitForUnpack(ref ProcessInformation processInfo, WinMemory memory, ref MemoryBasicInformation mbi, Stream gameAppData, bool antiCrash)
     {
-#if x64
         // Wait for client initialization.
         var initOffset = memory.Read(mbi.BaseAddress, (int)mbi.RegionSize)?.FindPattern(Patterns.Windows.Init) ?? 0;
 
@@ -435,23 +419,7 @@ static class Launcher
         while (memory.Read(initOffset + memory.BaseAddress, 1)?[0] == null ||
                memory.Read(initOffset + memory.BaseAddress, 1)?[0] == 0)
             memory.Data = memory.Read(mbi.BaseAddress, (int)mbi.RegionSize);
-#else
-        // Get PE header info for client initialization.
-        var peHeaders = new PEHeaders(gameAppData);
 
-        SectionHeader textSectionHeader = peHeaders.SectionHeaders.Single(sectionHeader => sectionHeader.Name.ToLower() == ".text");
-
-        gameAppData.Position = textSectionHeader.VirtualSize + textSectionHeader.PointerToRawData;
-
-        var textSectionEndValue = gameAppData.ReadByte();
-
-        Console.WriteLine("Waiting for client initialization...");
-
-        var virtualTextSectionEnd = memory.BaseAddress + textSectionHeader.VirtualAddress + textSectionHeader.VirtualSize;
-
-        while (memory?.Read(virtualTextSectionEnd, 1)?[0] == null || memory?.Read(virtualTextSectionEnd, 1)?[0] == textSectionEndValue)
-            Thread.Sleep(100);
-#endif
         if (antiCrash)
             PrepareAntiCrash(memory, ref mbi, ref processInfo);
 
